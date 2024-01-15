@@ -1,0 +1,315 @@
+import re
+import pandas as pd
+import os
+from os.path import expanduser
+import openpyxl
+import datetime
+import logging
+from flask import Flask, request, jsonify
+from openpyxl import load_workbook, Workbook
+from langchain.agents import create_sql_agent
+from langchain.agents.agent_toolkits import SQLDatabaseToolkit
+from langchain.sql_database import SQLDatabase
+from langchain.agents.agent_types import AgentType
+from langchain.chat_models import AzureChatOpenAI
+from langchain.agents.mrkl.prompt import FORMAT_INSTRUCTIONS
+from langchain.agents.agent_toolkits.sql.prompt import SQL_PREFIX
+
+
+app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                    filename='C:/Users/yash_kolhatkar/Desktop/Delivery_excellence/GenAI/ETL-GenAI/Logs/app.log')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s',
+                    filename='C:/Users/yash_kolhatkar/Desktop/Delivery_excellence/GenAI/ETL-GenAI/Logs/app.log')
+
+# Creating an object 
+logger = logging.getLogger()
+
+# Set the log level to DEBUG
+app.logger.setLevel(logging.DEBUG)
+
+# Setting the threshold of logger to DEBUG 
+handler = logging.StreamHandler()
+handler.setLevel(logging.DEBUG)
+app.logger.addHandler(handler)
+
+
+def get_db_uri(configuration_data):
+   logging.info(f"Inside get Database URI function")
+   # Extract source database attributes from the "SourceDB" sheet
+   source_db_attributes = configuration_data["SourceDB"]
+   source_db_attributes['Port'] = source_db_attributes['Port'].astype(str).str.strip()  # Ensure Port is treated as a string
+   source_db_uri = f"mysql+pymysql://{source_db_attributes.at[0, 'UserID']}:{source_db_attributes.at[0, 'Password']}@{source_db_attributes.at[0, 'Host']}:{source_db_attributes.at[0, 'Port']}/{source_db_attributes.at[0, 'Database']}"
+
+   # If the password is not provided, use a blank password
+   if pd.isna(source_db_attributes.at[0, 'Password']):
+      source_db_uri = f"mysql+pymysql://{source_db_attributes.at[0, 'UserID']}@{source_db_attributes.at[0, 'Host']}:{source_db_attributes.at[0, 'Port']}/{source_db_attributes.at[0, 'Database']}"
+   logging.info(f"SourceDB URI :{source_db_uri}")
+
+   # Extract target database attributes from the "TargetDB" sheet
+   target_db_attributes = configuration_data["TargetDB"]
+   target_db_attributes['Port'] = target_db_attributes['Port'].astype(str).str.strip()  # Ensure Port is treated as a string
+   target_db_uri = f"mysql+pymysql://{target_db_attributes.at[0, 'UserID']}:{target_db_attributes.at[0, 'Password']}@{target_db_attributes.at[0, 'Host']}:{target_db_attributes.at[0, 'Port']}/{target_db_attributes.at[0, 'Database']}"
+
+   # If the password is not provided, use a blank password
+   if pd.isna(target_db_attributes.at[0, 'Password']):
+      target_db_uri = f"mysql+pymysql://{target_db_attributes.at[0, 'UserID']}@{target_db_attributes.at[0, 'Host']}:{target_db_attributes.at[0, 'Port']}/{target_db_attributes.at[0, 'Database']}"
+   logging.info(f"TargetDB URI :{target_db_uri}")
+
+   return source_db_uri, target_db_uri, configuration_data
+
+
+custom_suffix = """you should first get the similar examples you know. If the examples are enough to construct the query, you can build it.
+               Otherwise, you can then look at the tables in the database to see what you can query.
+               Then you should query the schema of the most relevant tables. after operation, you should return the whole table data"""
+
+
+def create_toolkit_and_executor(db_uri):
+   logging.info(f"Inside create toolkit and executor function")
+   toolkit_params = {
+      "openai_api_base": "https://enggexopenai.openai.azure.com/",
+      "openai_api_type": "azure",
+      "openai_api_version": "2023-07-01-preview",
+      "openai_api_key": "0f13fd2e937642efb8a422394b85cb9d",
+      "deployment_name": "EnggExGPT35",
+      "request_timeout": 500,
+      "max_retries": 10,
+   }
+   logging.info(f"Toolkit Parameters :{toolkit_params}")
+
+   # Create SQLDatabaseToolkit
+   toolkit = SQLDatabaseToolkit(
+      db=SQLDatabase.from_uri(db_uri),
+      llm=AzureChatOpenAI(
+         temperature=0,
+         **toolkit_params,
+      ),
+      **toolkit_params,
+   )
+   logging.info(f"Toolkit :{toolkit}")
+
+   # Create AgentExecutor
+   agent_executor = create_sql_agent(
+      llm=AzureChatOpenAI(
+         temperature=0,
+         **toolkit_params,
+      ),
+      toolkit=toolkit,
+      verbose=True,
+      handle_parsing_errors=True,
+      agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+      top_k=1000,
+      return_intermediate_steps=True,
+      agent_kwargs={
+         'prefix': SQL_PREFIX,
+         'format_instructions': FORMAT_INSTRUCTIONS,
+         'suffix': custom_suffix
+      },
+      agent_executor_kwargs={"return_intermediate_steps": True}
+   )
+   logging.info(f"Agent Executor :{agent_executor}")
+   return agent_executor
+
+
+def execute_query(agent_executor, query):
+   logging.info(f"Inside execute query function")
+   return agent_executor.__call__(query)
+
+
+def compare_results(source_list, target_list):
+   logging.info(f"Inside compare results function")
+   # Compare the lists
+   if source_list == target_list:
+      return True
+   else:
+      return False
+
+
+def write_data_to_text_file(file_location ,file_name, source_results, target_results, difference):
+   file_name = file_location + file_name
+   logging.info(f"Inside Write data text file function with file name :{file_name}")
+   with open(file_name, "w") as file:
+      file.write("Fetched Transformed Source Data:\n")
+      file.write("\n".join(map(str, source_results)))
+
+      file.write("\n\n")
+
+      file.write("Fetched Target Data:\n")
+      file.write("\n".join(map(str, target_results)))
+
+      file.write("\n\n")
+
+      file.write("Difference Data betwween Transformed Source Data and Target Data:\n")
+      file.write("\n".join(map(str, difference)))
+
+   return True
+
+
+def find_difference(source_list, target_list):
+   logging.info(f"Inside compare results function")
+   differences = [item for item in source_list if item not in target_list] + [item for item in target_list if item not in source_list]
+   statistics = {
+      "{} records has been fetched from Source Table , ": len(source_list),
+      "{} records has been fetched from Target Table, ": len(target_list),
+      "{} records Differs ": len(differences),
+   }
+   
+   #Create message for statistics
+   stat_message = ""
+   result = ""
+   
+   #determine the name of the list where the differences were found
+   for key, value in statistics.items():
+      stat_message += key.format(value)
+   
+   if differences:
+      source_set = set(source_list)
+      target_set = set(target_list)
+      diff_set = set(differences)
+      common_in_source = bool(source_set.intersection(diff_set))
+      common_in_target = bool(target_set.intersection(diff_set))
+
+      if common_in_source and common_in_target:
+         result = "from Both Datasets."
+      elif common_in_source:
+         result = "from Source Dataset."
+      elif common_in_target:
+         result = "from Target Dataset."
+   else:
+      result = "so there are no Differences."
+   
+   final_stat_message = stat_message + result
+   logging.info(f"Final statistics message: {final_stat_message} and differences:{differences}")
+   return differences, final_stat_message
+
+
+def write_data_to_excel(result_file, test_results, file_name, file_location, statistics):
+   logging.info(f"Inside write data to excel function")
+   # Define constants for headers
+   TEST_RESULTS_HEADER = "Test Results"
+   PROCESSED_HEADER = "Processed Data"
+
+   create_headers = not os.path.exists(result_file)
+
+   try:
+      workbook = openpyxl.load_workbook(result_file)
+   except FileNotFoundError:
+      workbook = openpyxl.Workbook()
+      blank_sheet = workbook.active
+      workbook.remove(blank_sheet)
+
+   results_sheet = workbook["Results"] if "Results" in workbook.sheetnames else workbook.create_sheet("Results")
+
+   if create_headers:
+      results_sheet.append([TEST_RESULTS_HEADER, PROCESSED_HEADER])
+
+   # Append new test_results to the "Test_Results" column
+   results_sheet.append([test_results])
+
+   # Determine the next available row in the "Difference" column
+   result_column = results_sheet['A']
+   next_row = len(result_column)
+   
+   # Prepare the message for text file location
+   processed_data_message = '''The transformed data from the source and target databases, along with the differences between them
+   has been written to the file named {} at location {}.'''.format(file_name, file_location)
+
+   # Append the combined differences to the "Processed Data" column
+   results_sheet.cell(row=next_row, column=2, value=processed_data_message)
+   
+   workbook.save(result_file)
+
+
+def main(configuration_file):
+   logging.info(f"Inside Main function")
+   try:
+      logging.info(f"Configuration file: {configuration_file}")
+      configuration_file_df= pd.read_excel(configuration_file, sheet_name= None)
+      logging.info(f"Configuration file dataframe: {configuration_file_df}")
+      source_db_uri, target_db_uri, configuration_data = get_db_uri(configuration_file_df)
+      # Read the "ValidationScenarios" sheet
+      validation_scenarios = configuration_data["ValidationScenarios"]
+
+      # Iterate through each scenario
+      for index, scenario in validation_scenarios.iterrows():
+         logging.info(f"Validation Scenarios: {scenario}")
+         source_user_input = scenario['SourceUserInput']
+         target_user_input = scenario['TargetUserInput']
+
+         # Create source and target agent executors
+         source_agent_executor = create_toolkit_and_executor(source_db_uri)
+         target_agent_executor = create_toolkit_and_executor(target_db_uri)
+
+         # Initialize variables to store results
+         source_results = []
+         target_results = []
+         
+         if source_user_input and target_user_input:
+            source_query = source_user_input
+            source_query = re.sub(r'\n\s*', ' ', source_query)
+            source_result = execute_query(source_agent_executor, source_query)
+            intermidiate_steps = source_result['intermediate_steps'][-1:]
+            source_result = intermidiate_steps[0][-1:]
+            source_results.append(source_result)
+
+            target_query = target_user_input
+            target_query = re.sub(r'\n\s*', ' ', target_query)
+            target_result = execute_query(target_agent_executor, target_query)
+
+            # Split the data by newline character and select the portion after the first element
+            intermidiate_steps = target_result['intermediate_steps'][-1:]
+            target_result = intermidiate_steps[0][-1:]
+            target_results.append(target_result)
+         else:
+            source_result = "Input Prompts missing"
+            source_results.append(source_result)
+            target_result = "Input prompts missing"
+            target_results.append(target_result)
+
+         org_source_results = source_results[0][0]
+         org_target_results = target_results[0][0]
+
+         # Parse the strings into lists
+         source_list = eval(org_source_results)
+         target_list = eval(org_target_results)
+         
+         logging.info(f"Source Results:{source_list}")
+         logging.info(f"Target Results: {target_list}")
+
+         # Compare results from source and target
+         test_result = "Testing has passed. Results from transformed source and target databases are the same. " if compare_results(source_list, target_list) else "Testing has not passed. Results from transformed source and target databases differ."
+
+         logging.info(f"Test Results:{test_result}")
+         
+         difference, statistics = find_difference(source_list, target_list)
+
+         final_test_result = ""
+         final_test_result = test_result + statistics
+         
+         #Write the data into text file
+         # Get the user's home directory
+         home_dir = expanduser("~")
+         text_file_location =  os.path.join(home_dir, "Downloads/")
+         text_file_location = text_file_location.replace("\\", "/")
+         
+         text_file_name = "test_data_{}".format(str(index+1))
+
+         write_data_to_text_file(text_file_location, text_file_name, [org_source_results], [org_target_results], difference)
+         
+         #Create or load the Excel file and Write data to the Excel file
+         result_file_path = 'C:/Users/yash_kolhatkar/Desktop/Delivery_excellence/GenAI/ETL-GenAI/Data/Test Results.xlsx'
+         write_data_to_excel(result_file_path, final_test_result, text_file_name, text_file_location, statistics)
+         print(f"Scenario {index + 1}: {test_result}")
+         response_data = {"result": final_test_result}
+         logging.info(f"Final result:{response_data}")
+
+      return jsonify(response_data)
+
+   except Exception as e:
+      return {"error": str(e)}
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
